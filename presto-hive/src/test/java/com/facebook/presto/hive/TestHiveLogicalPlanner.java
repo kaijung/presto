@@ -18,6 +18,7 @@ import com.facebook.presto.cost.StatsProvider;
 import com.facebook.presto.metadata.FunctionManager;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.Subfield;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.TableScanNode;
@@ -36,6 +37,7 @@ import com.facebook.presto.sql.planner.assertions.SymbolAliases;
 import com.facebook.presto.sql.planner.plan.JoinNode;
 import com.facebook.presto.sql.planner.plan.SemiJoinNode;
 import com.facebook.presto.sql.relational.FunctionResolution;
+import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
 import com.facebook.presto.tests.DistributedQueryRunner;
 import com.google.common.base.Functions;
@@ -46,6 +48,7 @@ import org.testng.annotations.Test;
 
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -58,9 +61,11 @@ import static com.facebook.presto.hive.HiveSessionProperties.NESTED_COLUMNS_FILT
 import static com.facebook.presto.hive.HiveSessionProperties.PUSHDOWN_FILTER_ENABLED;
 import static com.facebook.presto.hive.TestHiveIntegrationSmokeTest.assertRemoteExchangesCount;
 import static com.facebook.presto.spi.function.OperatorType.EQUAL;
+import static com.facebook.presto.spi.predicate.Domain.singleValue;
 import static com.facebook.presto.spi.predicate.TupleDomain.withColumnDomains;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
+import static com.facebook.presto.spi.type.VarcharType.createVarcharType;
 import static com.facebook.presto.sql.analyzer.TypeSignatureProvider.fromTypes;
 import static com.facebook.presto.sql.planner.assertions.MatchResult.NO_MATCH;
 import static com.facebook.presto.sql.planner.assertions.MatchResult.match;
@@ -80,6 +85,7 @@ import static com.facebook.presto.sql.planner.plan.JoinNode.Type.INNER;
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static io.airlift.slice.Slices.utf8Slice;
 import static io.airlift.tpch.TpchTable.LINE_ITEM;
 import static io.airlift.tpch.TpchTable.ORDERS;
 import static java.lang.String.format;
@@ -96,6 +102,51 @@ public class TestHiveLogicalPlanner
     }
 
     @Test
+    public void testRepeatedFilterPushdown()
+    {
+        QueryRunner queryRunner = getQueryRunner();
+
+        try {
+            queryRunner.execute("CREATE TABLE orders_partitioned WITH (partitioned_by = ARRAY['ds']) AS " +
+                    "SELECT orderkey, orderpriority, '2019-11-01' as ds FROM orders WHERE orderkey < 1000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, orderpriority, '2019-11-02' as ds FROM orders WHERE orderkey < 1000");
+
+            queryRunner.execute("CREATE TABLE lineitem_unpartitioned AS " +
+                    "SELECT orderkey, linenumber, shipmode, '2019-11-01' as ds FROM lineitem WHERE orderkey < 1000 " +
+                    "UNION ALL " +
+                    "SELECT orderkey, linenumber, shipmode, '2019-11-02' as ds FROM lineitem WHERE orderkey < 1000 ");
+
+            TupleDomain<String> ordersDomain = withColumnDomains(ImmutableMap.of(
+                    "orderpriority", singleValue(createVarcharType(15), utf8Slice("1-URGENT"))));
+
+            TupleDomain<String> lineitemDomain = withColumnDomains(ImmutableMap.of(
+                    "shipmode", singleValue(createVarcharType(10), utf8Slice("MAIL")),
+                    "ds", singleValue(createVarcharType(10), utf8Slice("2019-11-02"))));
+
+            assertPlan(pushdownFilterEnabled(),
+                    "WITH a AS (\n" +
+                            "    SELECT ds, orderkey\n" +
+                            "    FROM orders_partitioned\n" +
+                            "    WHERE orderpriority = '1-URGENT' AND ds > '2019-11-01'\n" +
+                            "),\n" +
+                            "b AS (\n" +
+                            "    SELECT ds, orderkey, linenumber\n" +
+                            "    FROM lineitem_unpartitioned\n" +
+                            "    WHERE shipmode = 'MAIL'\n" +
+                            ")\n" +
+                            "SELECT * FROM a LEFT JOIN b ON a.ds = b.ds",
+                    anyTree(node(JoinNode.class,
+                            anyTree(tableScan("orders_partitioned", ordersDomain, TRUE_CONSTANT, ImmutableSet.of("orderpriority"))),
+                            anyTree(tableScan("lineitem_unpartitioned", lineitemDomain, TRUE_CONSTANT, ImmutableSet.of("shipmode", "ds"))))));
+        }
+        finally {
+            queryRunner.execute("DROP TABLE IF EXISTS orders_partitioned");
+            queryRunner.execute("DROP TABLE IF EXISTS lineitem_unpartitioned");
+        }
+    }
+
+    @Test
     public void testPushdownFilter()
     {
         Session pushdownFilterEnabled = pushdownFilterEnabled();
@@ -109,12 +160,12 @@ public class TestHiveLogicalPlanner
         assertPlan(pushdownFilterEnabled, "SELECT linenumber FROM lineitem WHERE partkey = 10",
                 output(exchange(
                         strictTableScan("lineitem", identityMap("linenumber")))),
-                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), Domain.singleValue(BIGINT, 10L))), TRUE_CONSTANT, ImmutableSet.of("partkey")));
+                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), singleValue(BIGINT, 10L))), TRUE_CONSTANT, ImmutableSet.of("partkey")));
 
         assertPlan(pushdownFilterEnabled, "SELECT partkey, linenumber FROM lineitem WHERE partkey = 10",
                 output(exchange(
                         strictTableScan("lineitem", identityMap("partkey", "linenumber")))),
-                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), Domain.singleValue(BIGINT, 10L))), TRUE_CONSTANT, ImmutableSet.of("partkey")));
+                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), singleValue(BIGINT, 10L))), TRUE_CONSTANT, ImmutableSet.of("partkey")));
 
         // Only remaining predicate
         assertPlan("SELECT linenumber FROM lineitem WHERE mod(orderkey, 2) = 1",
@@ -155,12 +206,12 @@ public class TestHiveLogicalPlanner
         assertPlan(pushdownFilterEnabled, "SELECT linenumber FROM lineitem WHERE partkey = 10 AND mod(orderkey, 2) = 1",
                 output(exchange(
                         strictTableScan("lineitem", identityMap("linenumber")))),
-                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), Domain.singleValue(BIGINT, 10L))), remainingPredicate, ImmutableSet.of("partkey", "orderkey")));
+                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), singleValue(BIGINT, 10L))), remainingPredicate, ImmutableSet.of("partkey", "orderkey")));
 
         assertPlan(pushdownFilterEnabled, "SELECT partkey, orderkey, linenumber FROM lineitem WHERE partkey = 10 AND mod(orderkey, 2) = 1",
                 output(exchange(
                         strictTableScan("lineitem", identityMap("partkey", "orderkey", "linenumber")))),
-                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), Domain.singleValue(BIGINT, 10L))), remainingPredicate, ImmutableSet.of("partkey", "orderkey")));
+                plan -> assertTableLayout(plan, "lineitem", withColumnDomains(ImmutableMap.of(new Subfield("partkey", ImmutableList.of()), singleValue(BIGINT, 10L))), remainingPredicate, ImmutableSet.of("partkey", "orderkey")));
     }
 
     @Test
@@ -178,34 +229,34 @@ public class TestHiveLogicalPlanner
                              "e map(varchar, bigint)))");
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE a[1] = 1",
-                        ImmutableMap.of(new Subfield("a[1]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("a[1]"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields where a[1 + 1] = 1",
-                        ImmutableMap.of(new Subfield("a[2]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("a[2]"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT *  FROM test_pushdown_filter_on_subfields WHERE b['foo'] = 1",
-                        ImmutableMap.of(new Subfield("b[\"foo\"]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("b[\"foo\"]"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE b[concat('f','o', 'o')] = 1",
-                        ImmutableMap.of(new Subfield("b[\"foo\"]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("b[\"foo\"]"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE c.a = 1",
-                        ImmutableMap.of(new Subfield("c.a"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("c.a"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE c.b.x = 1",
-                        ImmutableMap.of(new Subfield("c.b.x"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("c.b.x"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE c.c[5] = 1",
-                        ImmutableMap.of(new Subfield("c.c[5]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("c.c[5]"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE c.d[5] = 1",
-                        ImmutableMap.of(new Subfield("c.d[5]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("c.d[5]"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE c.e[concat('f', 'o', 'o')] = 1",
-                        ImmutableMap.of(new Subfield("c.e[\"foo\"]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("c.e[\"foo\"]"), singleValue(BIGINT, 1L)));
 
         assertPushdownFilterOnSubfields("SELECT * FROM test_pushdown_filter_on_subfields WHERE c.e['foo'] = 1",
-                        ImmutableMap.of(new Subfield("c.e[\"foo\"]"), Domain.singleValue(BIGINT, 1L)));
+                        ImmutableMap.of(new Subfield("c.e[\"foo\"]"), singleValue(BIGINT, 1L)));
 
         assertUpdate("DROP TABLE test_pushdown_filter_on_subfields");
     }
@@ -568,6 +619,18 @@ public class TestHiveLogicalPlanner
                     anyTree(join(INNER, ImmutableList.of(equiJoinClause("l_orderkey", "o_orderkey")),
                             anyTree(PlanMatchPattern.tableScan("lineitem", ImmutableMap.of("l_orderkey", "orderkey"))),
                             anyTree(PlanMatchPattern.tableScan("orders_ex", ImmutableMap.of("o_orderkey", "orderkey"))))));
+
+            assertPlan(joinReorderingOff, "SELECT l.discount, l.orderkey, o.totalprice FROM lineitem l, orders o WHERE l.orderkey = o.orderkey AND l.quantity < 2 AND o.totalprice BETWEEN 0 AND 200000",
+                    anyTree(
+                            node(JoinNode.class,
+                                    anyTree(tableScan("lineitem", ImmutableMap.of())),
+                                    anyTree(tableScan("orders", ImmutableMap.of())))));
+
+            assertPlan(joinReorderingOn, "SELECT l.discount, l.orderkey, o.totalprice FROM lineitem l, orders o WHERE l.orderkey = o.orderkey AND l.quantity < 2 AND o.totalprice BETWEEN 0 AND 200000",
+                    anyTree(
+                            node(JoinNode.class,
+                                    anyTree(tableScan("orders", ImmutableMap.of())),
+                                    anyTree(tableScan("lineitem", ImmutableMap.of())))));
         }
         finally {
             assertUpdate("DROP TABLE orders_ex");
@@ -651,6 +714,39 @@ public class TestHiveLogicalPlanner
         assertEquals(layoutHandle.getPredicateColumns().keySet(), predicateColumnNames);
         assertEquals(layoutHandle.getDomainPredicate(), domainPredicate);
         assertEquals(layoutHandle.getRemainingPredicate(), remainingPredicate);
+    }
+
+    private static PlanMatchPattern tableScan(String tableName, TupleDomain<String> domainPredicate, RowExpression remainingPredicate, Set<String> predicateColumnNames)
+    {
+        return PlanMatchPattern.tableScan(tableName).with(new Matcher() {
+            @Override
+            public boolean shapeMatches(PlanNode node)
+            {
+                return node instanceof TableScanNode;
+            }
+
+            @Override
+            public MatchResult detailMatches(PlanNode node, StatsProvider stats, Session session, Metadata metadata, SymbolAliases symbolAliases)
+            {
+                TableScanNode tableScan = (TableScanNode) node;
+
+                Optional<ConnectorTableLayoutHandle> layout = tableScan.getTable().getLayout();
+
+                if (!layout.isPresent()) {
+                    return NO_MATCH;
+                }
+
+                HiveTableLayoutHandle layoutHandle = (HiveTableLayoutHandle) layout.get();
+
+                if (!Objects.equals(layoutHandle.getPredicateColumns().keySet(), predicateColumnNames) ||
+                        !Objects.equals(layoutHandle.getDomainPredicate(), domainPredicate.transform(Subfield::new)) ||
+                        !Objects.equals(layoutHandle.getRemainingPredicate(), remainingPredicate)) {
+                    return NO_MATCH;
+                }
+
+                return match();
+            }
+        });
     }
 
     private static final class HiveTableScanMatcher
